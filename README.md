@@ -27,45 +27,60 @@ All credit for the actual downloading capabilities goes to these original creato
 
 ### Prerequisites
 
-- **Linux environment** (this tool is designed for Linux, also works on WSL)
-- **Root access** (the setup script must be run as root)
-- **Python 3.7+** with Flask
-- **Go** (for running the Apple Music Downloader)
-- **Git** (for cloning repositories)
 
-#### Important for WSL Users:
-This tool requires root privileges to install system packages and create symbolic links. On WSL, you need to:
-1. Open your WSL terminal
-2. Switch to root user: `sudo -i`  
-3. Then run the installation commands
+
+- **Linux environment** (this tool is designed for Linux, also works on WSL)
+
+- **Nix Package Manager** (Optional - will be automatically installed if missing)
+
+- **Git** (for cloning the repository)
+
+- **Root access** (only required if Nix needs to be installed)
+
+
 
 ### Installation
 
+
+
 1. **Clone this repository:**
+
    ```bash
+
    git clone https://github.com/lalit22km/alac-rip.git
+
    cd alac-rip
+
    ```
 
-2. **Switch to root user:**
+
+
+2. **Run the setup:**
+
    ```bash
-   sudo -i
-   ```
-   
-3. **Run the setup:**
-   ```bash
+
    python3 main.py
-   ```
-   
-   The first run will automatically:
-   - Install required system packages
-   - Download and setup Bento4
-   - Download the wrapper tool
-   - Clone the Apple Music Downloader
-   - Install Python dependencies
 
-4. **Access the web interface:**
+   ```
+
+   
+
+   The application will automatically:
+
+   - Check for Nix package manager and install it if missing
+
+   - Enter a reproducible environment with all dependencies (ffmpeg, gpac, python, etc.)
+
+   - Download and compile the wrapper tool
+
+   - Clone the Apple Music Downloader
+
+
+
+3. **Access the web interface:**
+
    - Open your browser and navigate to `http://localhost:5000`
+
    - The interface will be ready to use!
 
 ## 📖 Usage

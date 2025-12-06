@@ -1,205 +1,223 @@
 import os
 import subprocess
-import urllib.request
-import zipfile
-import tarfile
-from pathlib import Path
 import sys
+import shutil
+from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
-BENTO4_DIR = PROJECT_DIR / "bento4"
 WRAPPER_DIR = PROJECT_DIR / "wrapper"
 AMD_DIR = PROJECT_DIR / "apple-music-downloader"
 
-def firstsetup():
-    # --- Check for root ---
-    if os.geteuid() != 0:
-        print("❌ This script must be run as root. Exiting.")
+def is_nix_installed():
+    if shutil.which("nix-shell"):
+        return True
+    # Check common locations
+    candidates = [
+        "/nix/var/nix/profiles/default/bin/nix-shell",
+        os.path.expanduser("~/.nix-profile/bin/nix-shell"),
+        "/run/current-system/sw/bin/nix-shell"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return True
+    return False
+
+def install_nix():
+    print("⬇️ Nix not found. Installing Nix...")
+    try:
+        # Use the official installer
+        # We assume curl is available. 
+        install_cmd = "sh <(curl -L https://nixos.org/nix/install) --daemon --yes"
+        
+        # If not root, we might need to use non-daemon or let the script handle sudo
+        if os.geteuid() != 0:
+             print("ℹ️ Running as non-root, attempting Nix installation (sudo might be required)...")
+             # The script will prompt for sudo if needed for daemon install, or we can use --no-daemon
+             install_cmd = "sh <(curl -L https://nixos.org/nix/install) --yes"
+        
+        subprocess.run(install_cmd, shell=True, check=True)
+        print("✅ Nix installed successfully!")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to install Nix: {e}")
+        print("Please install Nix manually: https://nixos.org/download.html")
         sys.exit(1)
 
+def ensure_nix_environment():
+    # Check if we are already running inside the Nix shell wrapper
+    if os.environ.get("GEMINI_WRAPPED") == "1":
+        return
+
+    if not is_nix_installed():
+        install_nix()
+    
+    print("🔄 Switching to Nix environment...")
+    
+    nix_shell_cmd = shutil.which("nix-shell")
+    if not nix_shell_cmd:
+        # Try to find it in common paths if not in PATH yet
+        candidates = [
+            "/nix/var/nix/profiles/default/bin/nix-shell",
+            os.path.expanduser("~/.nix-profile/bin/nix-shell"),
+            "/run/current-system/sw/bin/nix-shell"
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                nix_shell_cmd = c
+                break
+    
+    if not nix_shell_cmd:
+        # If we just installed Nix, we might need to source the profile
+        # But we can't easily source in python.
+        # We can try to guess the path or ask user to restart shell.
+        print("⚠️ Could not find nix-shell in PATH. If you just installed Nix, you might need to restart your shell.")
+        # Try absolute path for standard multi-user install
+        if os.path.exists("/nix/var/nix/profiles/default/bin/nix-shell"):
+             nix_shell_cmd = "/nix/var/nix/profiles/default/bin/nix-shell"
+        else:
+             sys.exit(1)
+
+    # Relaunch inside nix-shell
+    shell_file = PROJECT_DIR / "shell.nix"
+    script_file = PROJECT_DIR / "main.py"
+    
+    # Propagate args
+    args = sys.argv[1:]
+    
+    # We use execv to replace the process
+    cmd = [
+        nix_shell_cmd, 
+        str(shell_file), 
+        "--run", 
+        f"python3 {script_file} {' '.join(args)}"
+    ]
+    
     try:
-        # Step 1: Install required packages
-        subprocess.run(
-            ["apt-get", "install", "-y", "git", "ffmpeg", "gpac", "golang-go", "wget","python3-flask","python3-yaml"],
-            check=True
-        )
-        print("✅ Packages installed successfully!")
+        print(f"Running: {' '.join(cmd)}")
+        os.execv(nix_shell_cmd, cmd)
+    except OSError as e:
+        print(f"❌ Failed to execute nix-shell: {e}")
+        sys.exit(1)
 
-        # Step 2: Download and set up Bento4
-        BENTO4_URL = "https://www.bok.net/Bento4/binaries/Bento4-SDK-1-6-0-641.x86_64-unknown-linux.zip"
-        zip_path = PROJECT_DIR / "bento4.zip"
+def setup_wrapper():
+    # Clone and compile wrapper if not exists
+    if (WRAPPER_DIR / "wrapper").exists() and (WRAPPER_DIR / "rootfs").exists():
+        print("ℹ️ Wrapper already exists, skipping setup")
+        return
 
-        if not BENTO4_DIR.exists():
-            print(f"⬇️ Downloading Bento4 from {BENTO4_URL}...")
-            urllib.request.urlretrieve(BENTO4_URL, zip_path)
-            print("Extracting Bento4...")
+    WRAPPER_REPO = "https://github.com/WorldObservationLog/wrapper.git"
+    temp_dir = PROJECT_DIR / "wrapper_temp"
+    deps_dir = PROJECT_DIR / "deps"
+    ndk_dir = deps_dir / "android-ndk-r23b"
 
-            BENTO4_DIR.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                zip_ref.extractall(BENTO4_DIR)
-            os.remove(zip_path)
-
-            print("✅ Bento4 installed inside project folder")
-            
-            # Create symbolic links to Bento4 tools in /usr/local/bin
-            bin_candidates = list(BENTO4_DIR.glob("Bento4*"))
-            if bin_candidates:
-                bin_dir = bin_candidates[0] / "bin"
-                print(f"DEBUG: Creating symbolic links for Bento4 tools from: {bin_dir}")
-                print(f"DEBUG: Bin directory exists: {bin_dir.exists()}")
-                
-                if not bin_dir.exists():
-                    print(f"ERROR: Bin directory does not exist: {bin_dir}")
-                    return
-                
-                # List all files for debugging
-                all_files = list(bin_dir.glob("*"))
-                print(f"DEBUG: All files in bin: {[f.name for f in all_files]}")
-                
-                # First, make all files executable (ZIP extraction doesn't preserve execute permissions)
-                print("Setting execute permissions on all Bento4 tools...")
-                for exe_file in all_files:
-                    if exe_file.is_file():
-                        try:
-                            # Add execute permission for owner, group, and others
-                            current_mode = exe_file.stat().st_mode
-                            new_mode = current_mode | 0o755  # rwxr-xr-x
-                            exe_file.chmod(new_mode)
-                            print(f"  CHMOD: Set execute permission on {exe_file.name}")
-                        except Exception as e:
-                            print(f"  ERROR: Failed to set execute permission on {exe_file.name}: {e}")
-                
-                # Now check for executable files again
-                executable_files = [f for f in all_files if f.is_file() and os.access(f, os.X_OK)]
-                print(f"DEBUG: Executable files after chmod: {[f.name for f in executable_files]}")
-                
-                # Add to current session PATH as well
-                os.environ["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
-                
-                # Create symbolic links with detailed error reporting
-                success_count = 0
-                error_count = 0
-                
-                for exe_file in executable_files:
-                    try:
-                        link_path = Path("/usr/local/bin") / exe_file.name
-                        print(f"DEBUG: Attempting to create symlink: {exe_file.name}")
-                        print(f"DEBUG: Source: {exe_file.absolute()}")
-                        print(f"DEBUG: Target: {link_path}")
-                        
-                        if link_path.exists():
-                            print(f"  INFO: Already exists: {exe_file.name}")
-                        else:
-                            os.symlink(str(exe_file.absolute()), str(link_path))
-                            print(f"  SUCCESS: Created symlink for {exe_file.name}")
-                            success_count += 1
-                            
-                    except Exception as e:
-                        print(f"  ERROR: Failed to create symlink for {exe_file.name}: {e}")
-                        error_count += 1
-                
-                print(f"SUMMARY: {success_count} symlinks created, {error_count} errors")
-                
-                # Verify what actually got created
-                print("Verifying /usr/local/bin contents...")
-                usr_local_bin = Path("/usr/local/bin")
-                if usr_local_bin.exists():
-                    bento4_links = [f for f in usr_local_bin.glob("*") if f.is_symlink()]
-                    print(f"Found {len(bento4_links)} symlinks in /usr/local/bin")
-                    for link in bento4_links:
-                        if any(exe.name == link.name for exe in executable_files):
-                            print(f"  VERIFIED: {link.name} -> {link.readlink()}")
-                else:
-                    print("ERROR: /usr/local/bin does not exist")
-            else:
-                print("⚠️ Could not find Bento4 extracted folder")
-                
-        else:
-            print("ℹ️ Bento4 already exists, skipping download")
-            
-            # Ensure Bento4 tools are available even if already downloaded
-            bin_candidates = list(BENTO4_DIR.glob("Bento4*"))
-            if bin_candidates:
-                bin_dir = bin_candidates[0] / "bin"
-                os.environ["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
-                
-                # Check if symbolic links need to be created
-                try:
-                    missing_links = []
-                    for exe_file in bin_dir.glob("*"):
-                        if exe_file.is_file() and os.access(exe_file, os.X_OK):
-                            link_path = Path("/usr/local/bin") / exe_file.name
-                            if not link_path.exists():
-                                missing_links.append((exe_file, link_path))
-                    
-                    if missing_links:
-                        print("🔗 Creating missing Bento4 symbolic links...")
-                        for exe_file, link_path in missing_links:
-                            os.symlink(exe_file, link_path)
-                            print(f"  ✅ Created symlink: {exe_file.name}")
-                    else:
-                        print("✅ Bento4 tools already available system-wide")
-                        
-                except Exception as e:
-                    print(f"⚠️ Could not verify/create symbolic links: {e}")
-                    print(f"✅ Added existing Bento4 bin to current session PATH: {bin_dir}")
-
-        # Step 3: Download and extract wrapper
-        WRAPPER_URL = "https://github.com/zhaarey/wrapper/releases/download/linux.V2/wrapper.x86_64.tar.gz"
-        wrapper_tar = PROJECT_DIR / "wrapper.x86_64.tar.gz"
-
-        if not WRAPPER_DIR.exists():
-            print(f"⬇️ Downloading wrapper from {WRAPPER_URL}...")
-            urllib.request.urlretrieve(WRAPPER_URL, wrapper_tar)
-            print("Extracting wrapper...")
-
-            WRAPPER_DIR.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(wrapper_tar, "r:gz") as tar:
-                tar.extractall(WRAPPER_DIR)
-            os.remove(wrapper_tar)
-
-            print("✅ Wrapper extracted inside project folder")
-        else:
-            print("ℹ️ Wrapper already exists, skipping download")
-
-        # Step 4: Clone Apple Music Downloader repo
-        if not AMD_DIR.exists():
-            print("⬇️ Cloning Apple Music Downloader...")
+    # Clean up temp dir if it exists from a previous failed run
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    
+    # 1. Setup NDK
+    if not ndk_dir.exists():
+        print("⬇️ Android NDK not found. Downloading...")
+        deps_dir.mkdir(parents=True, exist_ok=True)
+        ndk_zip = deps_dir / "android-ndk-r23b-linux.zip"
+        try:
             subprocess.run(
-                ["git", "clone", "https://github.com/zhaarey/apple-music-downloader", str(AMD_DIR)],
+                ["wget", "-O", str(ndk_zip), "https://dl.google.com/android/repository/android-ndk-r23b-linux.zip"],
                 check=True
             )
-            print("✅ Apple Music Downloader cloned inside project folder")
+            print("📦 Unzipping NDK...")
+            subprocess.run(["unzip", "-q", "-d", str(deps_dir), str(ndk_zip)], check=True)
+            # Remove zip to save space? Optional.
+            if ndk_zip.exists():
+                os.remove(ndk_zip)
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Failed to setup NDK: {e}")
+            sys.exit(1)
+    
+    print(f"⬇️ Cloning wrapper from {WRAPPER_REPO}...")
+    try:
+        subprocess.run(["git", "clone", WRAPPER_REPO, str(temp_dir)], check=True)
+        
+        build_dir = temp_dir / "build"
+        build_dir.mkdir()
+        
+        print("⚙️ Compiling wrapper...")
+        # We need to set HOME to deps_dir because CMakeLists.txt expects NDK at $HOME/android-ndk-r23b
+        env = os.environ.copy()
+        env["HOME"] = str(deps_dir)
+        
+        subprocess.run(["cmake", ".."], cwd=build_dir, env=env, check=True)
+        # Get core count for parallel build
+        nproc = subprocess.check_output(["nproc"]).decode().strip()
+        subprocess.run(["make", f"-j{nproc}"], cwd=build_dir, env=env, check=True)
+        
+        WRAPPER_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Copy wrapper binary
+        # The wrapper binary is built in the source directory (temp_dir) due to BUILD_IN_SOURCE 1
+        if (temp_dir / "wrapper").exists():
+            shutil.move(str(temp_dir / "wrapper"), str(WRAPPER_DIR / "wrapper"))
         else:
-            print("ℹ️ Apple Music Downloader already exists, skipping clone")
+            # Fallback or check if it's in build_dir just in case, though logs show otherwise
+            print(f"⚠️ Could not find wrapper binary in {temp_dir / 'wrapper'}")
+            shutil.move(str(build_dir / "wrapper"), str(WRAPPER_DIR / "wrapper"))
+        
+        # Copy rootfs
+        # If rootfs already exists in destination, remove it first?
+        if (WRAPPER_DIR / "rootfs").exists():
+            shutil.rmtree(WRAPPER_DIR / "rootfs")
+        shutil.copytree(str(temp_dir / "rootfs"), str(WRAPPER_DIR / "rootfs"))
 
-        print("🎉 First setup complete!")
-
+        # Cleanup temp
+        shutil.rmtree(temp_dir)
+        print("✅ Wrapper setup complete")
+        
     except subprocess.CalledProcessError as e:
-        print(f"❌ Failed during setup: {e}")
+        print(f"❌ Failed to setup wrapper: {e}")
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        sys.exit(1)
+
+def clone_amd_repo():
+    if AMD_DIR.exists():
+        print("ℹ️ Apple Music Downloader already exists, skipping clone")
+        return
+
+    print("⬇️ Cloning Apple Music Downloader...")
+    try:
+        subprocess.run(
+            ["git", "clone", "https://github.com/zhaarey/apple-music-downloader", str(AMD_DIR)],
+            check=True
+        )
+        print("✅ Apple Music Downloader cloned inside project folder")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to clone Apple Music Downloader: {e}")
         sys.exit(1)
 
 def start():
     print("🚀 Starting Apple Music Downloader Web UI...")
-
-    # Ensure Bento4 and Wrapper are in PATH locally
-    bin_candidates = list(BENTO4_DIR.glob("Bento4*"))  # find extracted folder
-    if bin_candidates:
-        bin_dir = bin_candidates[0] / "bin"
-        os.environ["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
-
+    
+    # Add Wrapper to PATH
     os.environ["PATH"] = f"{WRAPPER_DIR}:{os.environ['PATH']}"
+    
+    # Set executable permissions for the wrapper
+    wrapper_path = WRAPPER_DIR / "wrapper"
+    if wrapper_path.exists():
+        wrapper_path.chmod(0o755)
 
     # Import and run the Flask app
-    from app import app   # FIXED: no double "app.app"
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    try:
+        from app import app
+        app.run(host="0.0.0.0", port=5000, debug=True)
+    except ImportError as e:
+        print(f"❌ Failed to import app: {e}")
+        print("Ensure you are running inside the nix-shell environment.")
+        sys.exit(1)
 
-# === First run check ===
-marker_file = PROJECT_DIR / "firstrun"
-
-if not marker_file.exists():
-    firstsetup()
-    with open(marker_file, "w") as f:
-        f.write("This file marks that first setup has been completed.\n")
-
-start()
+if __name__ == "__main__":
+    # Ensure we are in Nix environment
+    ensure_nix_environment()
+    
+    # Dependencies are now met (via nix-shell)
+    setup_wrapper()
+    clone_amd_repo()
+    
+    start()
